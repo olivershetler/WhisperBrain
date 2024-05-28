@@ -815,7 +815,7 @@ def decode(
     result: Union[DecodingResult, List[DecodingResult]]
         The result(s) of decoding contained in `DecodingResult` dataclass instance(s)
     """
-    if single := mel.ndim == 2:
+    if single := len(mel.shape) == 2:
         mel = mel.unsqueeze(0)
 
     if kwargs:
