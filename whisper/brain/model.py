@@ -202,6 +202,106 @@ class BrainEncoder(nn.Module):
         x = self.encoder(x)
         return x
 
+class EmbeddingDiscriminator(nn.Module):
+    """A GAN discriminator that takes in a tensor of shape (N, T, D) and outputs a tensor of shape (N, 1)"""
+    def __init__(self, sequence_length: int, embedding_dim: int):
+        super().__init__()
+        self.conv_block = nn.Sequential(
+            nn.Conv1d(
+                in_channels=embedding_dim,
+                out_channels=embedding_dim//4,
+                kernel_size=3,
+                stride=1,
+                padding=1
+            ),
+            nn.GELU(),
+            nn.Dropout(p=0.3),
+            nn.Conv1d(
+                in_channels=embedding_dim//4,
+                out_channels=embedding_dim//16,
+                kernel_size=3,
+                stride=1,
+                padding=1
+            ),
+            nn.GELU(),
+            nn.Dropout(p=0.2),
+            nn.Conv1d(
+                in_channels=embedding_dim//32,
+                out_channels=1,
+                kernel_size=3,
+                stride=1,
+                padding=1
+            ),
+            nn.GELU(),
+        )
+        self.dense_block = nn.Sequential(
+            nn.Linear(sequence_length, sequence_length//5),
+            nn.GELU(),
+            nn.Dropout(p=0.3),
+            nn.Linear(sequence_length//5, sequence_length//10),
+            nn.GELU(),
+            nn.Dropout(p=0.2),
+            nn.Linear(sequence_length//10, sequence_length//25),
+            nn.GELU(),
+            nn.Dropout(p=0.1),
+            nn.Linear(sequence_length//25, sequence_length//125),
+            nn.GELU(),
+            nn.Linear(sequence_length//125, 1),
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)  # Change shape from (N, T, D) to (N, D, T) for Conv1d
+        x = self.conv_block(x)
+        x = x.view(x.size(0), -1)  # Flatten for the dense block
+        x = self.dense_block(x)
+        x = self.sigmoid(x)
+        return x
+
+class LogitsDiscriminator(nn.Module):
+    """A GAN discriminator that takes in a tensor of shape (N, S, 51864) and outputs a tensor of shape (N, 1)"""
+    def __init__(self, vocab_size: int = 51864, embedding_dim: int = 512, hidden_dim: int = 256):
+        super().__init__()
+        # Reduce vocabulary dimension
+        self.fc1 = nn.Linear(vocab_size, embedding_dim)
+        self.gelu1 = nn.GELU()
+
+        # Recurrent layer
+        self.lstm = nn.LSTM(embedding_dim, hidden_dim, batch_first=True, bidirectional=True)
+
+        # Fully connected layers
+        self.fc2 = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.gelu2 = nn.GELU()
+        self.fc3 = nn.Linear(hidden_dim, 1)
+
+        # Output activation
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # Reduce vocabulary dimension
+        N, S, V = x.shape
+        x = x.view(-1, V)  # Shape: (N*S, V)
+        x = self.fc1(x)
+        x = self.gelu1(x)
+
+        # Restore sequence dimension
+        x = x.view(N, S, -1)  # Shape: (N, S, embedding_dim)
+
+        # LSTM layer
+        x, _ = self.lstm(x)
+
+        # Pooling across the sequence length
+        x, _ = torch.max(x, dim=1)  # Shape: (N, hidden_dim * 2)
+
+        # Fully connected layers
+        x = self.fc2(x)
+        x = self.gelu2(x)
+        x = self.fc3(x)
+
+        # Output activation
+        x = self.sigmoid(x)
+
+        return x
 
 class WhisperBrain(nn.Module):
     def __init__(self, dims: ModelDimensions):
@@ -269,7 +369,8 @@ class WhisperBrain(nn.Module):
             'whisper': self.whisper,
             'text': self.whisper.decoder,
             'audio': self.whisper.encoder,
-            'brain': self.brain_encoder
+            'brain': self.brain_encoder,
+            'brain_transformer': self.brain_encoder.encoder
         }
         if unfreeze not in [True, False]:
             raise ValueError("unfreeze must be a boolean value")

@@ -1,6 +1,28 @@
 import torch
 import torch.nn.functional as F
 
+
+
+
+
+def alignment_loss(brain_embeddings, audio_embeddings):
+    # mean square error loss
+    mse_loss = F.mse_loss(brain_embeddings, audio_embeddings)
+    # cosine similarity along the time axis
+    brain_norm = F.normalize(brain_embeddings, dim=1)
+    audio_norm = F.normalize(audio_embeddings, dim=1)
+    cosine_sim = torch.einsum('nct,ncp->ntp', brain_norm, audio_norm)
+    # mean of the diagonal
+    time_alignment = cosine_sim.diagonal(dim1=1, dim2=2).mean()
+    # cosine similarity along the feature axis
+    brain_norm = F.normalize(brain_embeddings, dim=2)
+    audio_norm = F.normalize(audio_embeddings, dim=2)
+    cosine_sim = torch.einsum('nct,npt->nctp', brain_norm, audio_norm)
+    # mean of the diagonal
+    feature_alignment = cosine_sim.diagonal(dim1=2, dim2=3).mean()
+    return mse_loss, time_alignment, feature_alignment
+
+
 def gaussian_kernel(iqr):
     sigma = iqr / 1.349  # Calculate sigma from IQR
     window_size = int(2 * sigma) * 2 + 1

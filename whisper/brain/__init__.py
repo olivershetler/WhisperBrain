@@ -20,6 +20,8 @@ def initialize_from_whisper(name: str, device: Optional[Union[str, torch.device]
     whisper = load_model(name, device, download_root, in_memory)
     whisper_brain = WhisperBrain(whisper.dims)
     whisper_brain.whisper = whisper
+    # copy the weights from the whisper.encoder to the whisper_brain.encoder.encoder
+    whisper_brain.brain_encoder.encoder.load_state_dict(whisper.encoder.state_dict().copy())
     whisper_brain.to(device)
     return whisper_brain
 
