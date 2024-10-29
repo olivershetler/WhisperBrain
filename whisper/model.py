@@ -173,6 +173,7 @@ class AudioEncoder(nn.Module):
         return x
 
 
+
 class TextDecoder(nn.Module):
     def __init__(
         self, n_vocab: int, n_ctx: int, n_state: int, n_head: int, n_layer: int

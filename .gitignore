@@ -10,3 +10,14 @@ thumbs.db
 .idea
 
 .venv
+venv
+env
+.env
+VENV
+ENV
+.ENV
+.VENV
+
+**/wandb/
+notebooks/wandb/
+**/wandb/

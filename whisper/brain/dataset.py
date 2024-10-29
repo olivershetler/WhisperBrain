@@ -85,13 +85,13 @@ class WillettDataset:
 
             assert mel.shape[-1] == neural_data.shape[-1], f"Mel signal length {mel.shape[-1]} should be half of the brain signal length {neural_data.shape[-1]} with overall shape {neural_data.shape}"
 
-            return (neural_data, mel, text, signal_length)
+            return (neural_data.to(self.device), mel.to(self.device), text, signal_length)
 
     def preprocess_neural_data(self, neural_data):
         # neural data is of shape (T, 2, 2, 5, 8, 8)
         neural_data = torch.tensor(neural_data)
-        neural_data = self._smooth_threshold_crossings(neural_data)
-        neural_data = self._add_noise_to_threshold_crossings(neural_data)
+        #neural_data = self._smooth_threshold_crossings(neural_data)
+        #neural_data = self._add_noise_to_threshold_crossings(neural_data)
         neural_data = self._normalize_neural_data(neural_data)
         # permute T to the last dimension to match the audio signal
         neural_data = neural_data.permute(1, 2, 3, 4, 5, 0).to(self.device)
@@ -101,16 +101,19 @@ class WillettDataset:
     def _normalize_neural_data(self, neural_data):
         for region in range(2):
             for subregion in range(2):
-                for channel in range(4):
-                    neural_data[:, region, subregion, channel, :, :] = self.normalize(neural_data[:, region, subregion, channel, :, :])
+                neural_data[:, region, subregion, 0, :, :] = self.normalize(neural_data[:, region, subregion, 0, :, :])
+                neural_data[:, region, subregion, 1:, :, :] = self.clip(neural_data[:, region, subregion, 1:, :, :])
         return neural_data
 
     def normalize(self, data):
         return (data - data.mean()) / data.std()
 
+    def clip(self, data):
+        return torch.clamp(data, min=0, max=1)
+
     def _smooth_threshold_crossings(self, neural_data):
         """Applies Exponential Weighted Moving Average smoothing to each channel."""
-        grid = [(a, sa, c, y, x) for a in range(2) for sa in range(2) for c in range(1,4) for y in range(8) for x in range(8)]
+        grid = [(a, sa, c, y, x) for a in range(2) for sa in range(2) for c in range(2,4) for y in range(8) for x in range(8)]
         for (a, sa, c, y, x) in grid:
             neural_data[:,a,sa,c,y,x]= self._smooth_channel(neural_data[:,a,sa,c,y,x])
         return neural_data
@@ -119,7 +122,7 @@ class WillettDataset:
         alpha = 2 /(window_size + 1)
         b = [alpha]
         a = [1, alpha-1]
-        zi = lfiltic(b, a, channel[0:1], [0])
+        zi = lfiltic(b, a, channel[0:1].numpy(), [0])
         return torch.tensor(lfilter(b, a, channel, zi=zi)[0])
 
     def _add_noise_to_threshold_crossings(self, neural_data):
@@ -127,7 +130,7 @@ class WillettDataset:
         noise_shape = list(neural_data.shape)
         noise_shape[3] = noise_shape[3] - 1
         noise_shape = tuple(noise_shape)
-        neural_data[:, :, :, 1:, :, :] += 0.1 * torch.randn(noise_shape)
+        neural_data[:, :, :, 1:, :, :] += 0.2 * torch.randn(noise_shape)
         return neural_data
 
     def preprocess_audio(self, audio):

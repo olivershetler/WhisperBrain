@@ -5,91 +5,88 @@ import torch.nn.functional as F
 
 
 
-def alignment_loss(brain_embeddings, audio_embeddings):
-    # mean square error loss
-    mse_loss = F.mse_loss(brain_embeddings, audio_embeddings)
-    # cosine similarity along the time axis
-    brain_norm = F.normalize(brain_embeddings, dim=1)
-    audio_norm = F.normalize(audio_embeddings, dim=1)
-    cosine_sim = torch.einsum('nct,ncp->ntp', brain_norm, audio_norm)
-    # mean of the diagonal
-    time_alignment = cosine_sim.diagonal(dim1=1, dim2=2).mean()
-    # cosine similarity along the feature axis
-    brain_norm = F.normalize(brain_embeddings, dim=2)
-    audio_norm = F.normalize(audio_embeddings, dim=2)
-    cosine_sim = torch.einsum('nct,npt->nctp', brain_norm, audio_norm)
-    # mean of the diagonal
-    feature_alignment = cosine_sim.diagonal(dim1=2, dim2=3).mean()
-    return mse_loss, time_alignment, feature_alignment
+class ClipLoss(torch.nn.Module):
+    """CLIP (See Open AI CLIP) constrastive loss.
+    """
+    def __init__(self, linear=None, twin=True, pool=False, tmin=None, tmax=None,
+                 tmin_train=None, tmax_train=None, dset_args=None, center=False):
+        super().__init__()
+        self.linear = None
+        self.pool = pool
+        self.center = center
+        if linear is not None:
+            self.linear_est = torch.nn.LazyLinear(linear)
+            if twin:
+                self.linear_gt = self.linear_est
+            else:
+                self.linear_gt = torch.nn.LazyLinear(linear)
+        self.tmin = tmin
+        self.tmax = tmax
+        self.tmin_train = tmin_train
+        self.tmax_train = tmax_train
+        self.dset_args = dset_args
 
-
-def gaussian_kernel(iqr):
-    sigma = iqr / 1.349  # Calculate sigma from IQR
-    window_size = int(2 * sigma) * 2 + 1
-    x = torch.arange(window_size) - window_size // 2
-    kernel = torch.exp(-x**2 / (2 * sigma**2))
-    kernel = kernel / kernel.sum()  # Normalize the kernel
-    return kernel, sigma
-
-def temporal_gaussian_infonce_loss(brain_embeddings, audio_embeddings, temperature=0.07, iqr=20, neg_sample_prop=None):
-    N, C, T = brain_embeddings.shape
-
-    # Normalize the embeddings
-    brain_norm = F.normalize(brain_embeddings, dim=1)
-    audio_norm = F.normalize(audio_embeddings, dim=1)
-
-    # Calculate the pairwise cosine similarities
-    cosine_sim = torch.einsum('nct,ncp->ntp', brain_norm, audio_norm) / temperature
-
-    # Create a Gaussian kernel based on the provided IQR
-    kernel, sigma = gaussian_kernel(iqr)
-    kernel = kernel.to(brain_embeddings.device)
-    window_size = len(kernel)
-
-    # Apply the Gaussian kernel to the similarities
-    gaussian_weights = F.pad(kernel, (0, T - window_size), mode='constant', value=0)
-    gaussian_weights = gaussian_weights.unsqueeze(0).expand(T, -1)
-    weighted_cosine_sim = torch.zeros_like(cosine_sim)
-
-    for t in range(T):
-        weighted_cosine_sim[:, t, :] = cosine_sim[:, t, :] * gaussian_weights[t]
-
-    # InfoNCE loss calculation
-    pos_sim = torch.exp(weighted_cosine_sim.diagonal(dim1=1, dim2=2))  # Positive pairs
-
-    # Mask out the positive pairs and nearby pairs for negative samples
-    mask_radius = int(2 * sigma)
-    mask = torch.eye(T, device=brain_embeddings.device).unsqueeze(0).expand(N, -1, -1)
-    for i in range(1, mask_radius + 1):
-        mask += torch.eye(T, device=brain_embeddings.device).unsqueeze(0).expand(N, -1, -1).roll(shifts=i, dims=1)
-        mask += torch.eye(T, device=brain_embeddings.device).unsqueeze(0).expand(N, -1, -1).roll(shifts=-i, dims=1)
-
-    neg_sim = torch.exp(weighted_cosine_sim) * (1 - mask)
-
-    # Optionally retain only a proportion or a fixed number of negative samples
-    if neg_sample_prop is not None:
-        if isinstance(neg_sample_prop, float) and 0 < neg_sample_prop < 1:
-            num_neg_samples = int(neg_sample_prop * T)
-        elif isinstance(neg_sample_prop, int) and neg_sample_prop > 1:
-            num_neg_samples = neg_sample_prop
+    def trim_samples(self, estimates, candidates):
+        """Given estimates that is [B1, C, T] and candidates
+        which is [B2, C, T], return estimates_trim of size [B1, C, T']
+        and candidates_trim of size [B2, C, T'], such that T'
+        corresponds to the samples between [self.tmin, self.tmax]
+        """
+        if self.training and (self.tmin_train is not None or self.tmax_train is not None):
+            tmin, tmax = self.tmin_train, self.tmax_train
         else:
-            raise ValueError("neg_sample_prop should be a float between 0 and 1, or an integer greater than 1")
+            tmin, tmax = self.tmin, self.tmax
+        if (tmin is not None) or (tmax is not None):
+            assert self.dset_args is not None
+            assert self.dset_args.tmin is not None
+            dset_tmin = self.dset_args.tmin
+        if tmin is None:
+            trim_min = 0
+        else:
+            assert tmin >= dset_tmin, 'clip.tmin should be above dset.tmin'
+            trim_min = int((-dset_tmin + tmin) * self.dset_args.sample_rate)
+        if tmax is None:
+            trim_max = estimates.shape[-1]
+        else:
+            trim_max = int((-dset_tmin + tmax) * self.dset_args.sample_rate)
+        estimates_trim = estimates[..., trim_min:trim_max]
+        candidates_trim = candidates[..., trim_min:trim_max]
+        return estimates_trim, candidates_trim
 
-        neg_indices = torch.randperm(T)[:num_neg_samples].to(brain_embeddings.device)
-        neg_sim = neg_sim[:, :, neg_indices]
+    def get_scores(self, estimates: torch.Tensor, candidates: torch.Tensor):
+        """Given estimates that is [B, C, T] and candidates
+        which is [B', C, T], return a [B, B'] matrix of scores of matching.
+        """
+        estimates, candidates = self.trim_samples(estimates, candidates)
+        if self.linear:
+            estimates = self.linear_est(estimates)
+            candidates = self.linear_gt(candidates)
+        if self.pool:
+            estimates = estimates.mean(dim=2, keepdim=True)
+            candidates = candidates.mean(dim=2, keepdim=True)
+        if self.center:
+            estimates = estimates - estimates.mean(dim=(1, 2), keepdim=True)
+            candidates = candidates - candidates.mean(dim=(1, 2), keepdim=True)
+        inv_norms = 1 / (1e-8 + candidates.norm(dim=(1, 2), p=2))
+        # We normalize inside the einsum, to avoid creating a copy
+        # of candidates, which can be pretty big.
+        scores = torch.einsum("bct,oct,o->bo", estimates, candidates, inv_norms)
+        return scores
 
-    loss = -torch.log(pos_sim / neg_sim.sum(dim=-1)).mean()
+    def get_probabilities(self, estimates, candidates):
+        """Given estimates that is [B, C, T] and candidates
+        which is [B', C, T], return a [B, B'] matrix of probabilities of matching.
+        """
+        scores = self.get_scores(estimates, candidates)
+        return F.softmax(scores, dim=1)
 
-    return loss
-
-def mse_adjusted_temporal_gaussian_infonce_loss(brain_embeddings, audio_embeddings, sequence_length, alpha=0.5, iqr=20, temperature=0.07, neg_sample_prop=None):
-    mse_loss = F.mse_loss(brain_embeddings, audio_embeddings)
-    brain_embeddings = brain_embeddings[:, :, :sequence_length//2]
-    audio_embeddings = audio_embeddings[:, :, :sequence_length//2]
-    contrastive_loss = temporal_gaussian_infonce_loss(brain_embeddings, audio_embeddings, temperature, iqr=iqr, neg_sample_prop=neg_sample_prop)
-
-    # Combine the losses using a static alpha
-    combined_loss = alpha * contrastive_loss + (1 - alpha) * mse_loss
-
-    return combined_loss
-
+    def forward(self, estimate, candidate):
+        """Warning: estimate and candidate are not symmetrical.
+        If estimate of shape [B, C, T] and candidate of size [B', C, T]
+        with B'>=B, the first B samples of candidate are targets, while
+        the remaining B'-B samples of candidate are only used as negatives.
+        """
+        assert estimate.size(0) <= candidate.size(0), "need at least as many targets as estimates"
+        scores = self.get_scores(estimate, candidate)
+        target = torch.arange(len(scores), device=estimate.device)
+        return F.cross_entropy(scores, target)

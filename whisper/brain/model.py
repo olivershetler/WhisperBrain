@@ -1,7 +1,8 @@
 import torch
 from torch import nn, Tensor
-from typing import Dict, Optional
-from whisper.model import Whisper, ModelDimensions, LayerNorm, AudioEncoder
+import torch.nn.functional as F
+from typing import Dict, Optional, Iterable
+from whisper.model import Whisper, ModelDimensions, LayerNorm, AudioEncoder, ResidualAttentionBlock, Conv1d, sinusoids
 
 from whisper.decoding import DecodingTask
 from whisper.decoding import detect_language as detect_language_function
@@ -41,26 +42,6 @@ class BrainRegionIntakeBlock(nn.Module):
     """
     def __init__(self):
         super().__init__() #TODO revise this block, since these are just random guesses
-
-        def conv_block(depth, in_channels, out_channels, kernel_size, stride, padding):
-            block_list = []
-            for i in range(depth):
-                if i == 0:
-                    block_list.append(nn.Conv3d(
-                        in_channels=in_channels,
-                        out_channels=out_channels,
-                        kernel_size=kernel_size,
-                        stride=stride,
-                        padding=padding))
-                else:
-                    block_list.append(nn.Conv3d(
-                        in_channels=out_channels,
-                        out_channels=out_channels,
-                        kernel_size=kernel_size,
-                        stride=stride,
-                        padding=padding))
-                block_list.append(nn.GELU())
-            return nn.Sequential(*block_list)
 
         def res_block (depth, in_channels, out_channels, kernel_size, stride, padding):
             block_list = []
@@ -109,35 +90,29 @@ class BrainRegionIntakeBlock(nn.Module):
         )
 
         self.dense_block = nn.Sequential(
-            nn.Linear(5 * 8 * 8, (5 * 8 * 8) // 2), # 5 * 8 * 8 = 320 -> 160
+            nn.Linear(5 * 8 * 8, (5 * 8 * 8) // 8),
             nn.GELU(),
-            nn.Linear((5 * 8 * 8) // 2, (5 * 8 * 8) // 4), # 160 -> 80
-            nn.GELU(),
-            nn.Linear((5 * 8 * 8) // 4, (5 * 8 * 8) // 8), # 80 -> 40
-            nn.GELU(),
-            nn.Linear((5 * 8 * 8) // 8, (5 * 8 * 8) // 16), # 40 -> 20
+            nn.Linear((5 * 8 * 8) // 8, (5 * 8 * 8) // 16),
             nn.GELU(),
         )
-
         self.ln = LayerNorm(20)
-        self.fn = nn.Linear(20, 20)
 
     def forward(self, x: Tensor):
         # x is of shape (N, 5, 8, 8, T)
+        N, T, F = x.shape[0], x.shape[-1], x.shape[1] * x.shape[2] * x.shape[3]
         x = self.conv_intake(x)
         x = self.spatial_res(x)
         x = self.temporal_res(x)
         # reshape the tensor to (N, T, 5, 8, 8)
         x = x.permute(0, 4, 1, 2, 3)
         # reshape the tensor to (N, T, 5 * 8 * 8)
-        x = x.view(x.shape[0], x.shape[1], -1)
+        x = x.reshape(N, T, -1)
         # reshape the tensor to (N*T, F)
-        x = x.view(-1, x.shape[-1])
+        x = x.reshape(N*T, F)
         x = self.dense_block(x)
         x = self.ln(x)
-        x = self.fn(x)
         # reshape the tensor to (N, T, F)
-        x = x.view(-1, x.shape[0], x.shape[1])
+        x = x.reshape(N, T, -1)
         return x
 
 class BrainPreNet(nn.Module):
@@ -164,23 +139,50 @@ class BrainPreNet(nn.Module):
     def forward(self, x: Tensor):
         N = x.shape[0]
         T = x.shape[1]
-        # Divide the tensor (N, T, 2, 2, 5, 8, 8) into 4 tensors of shape (N, T, 1, 1, 5, 8, 8) and then squeeze the extra dimensions into (N, T, 5, 8, 8) then permute to (N, 5, 8, 8, T)
-        inferior_6v = x[:, 0, 1].squeeze((1, 2))
-        superior_6v = x[:, 0, 0].squeeze((1, 2))
-        inferior_44 = x[:, 1, 1].squeeze((1, 2))
-        superior_44 = x[:, 1, 0].squeeze((1, 2))
 
+        # Divide the tensor (N, T, 2, 2, 5, 8, 8) into 4 tensors of shape (N, T, 1, 1, 5, 8, 8) and then squeeze the extra dimensions into (N, T, 5, 8, 8) then permute to (N, 5, 8, 8, T)
         # Apply the intake blocks to convert the tensors into tensors of shape (N, T, F)
-        inferior_6v = self.inferior_6v_intake(inferior_6v)
-        superior_6v = self.superior_6v_intake(superior_6v)
-        inferior_44 = self.inferior_44_intake(inferior_44)
-        superior_44 = self.superior_44_intake(superior_44)
+        inferior_6v = self.inferior_6v_intake(x[:, 0, 1].squeeze((1, 2)))
+        superior_6v = self.superior_6v_intake(x[:, 0, 0].squeeze((1, 2)))
+        inferior_44 = self.inferior_44_intake(x[:, 1, 1].squeeze((1, 2)))
+        superior_44 = self.superior_44_intake(x[:, 1, 0].squeeze((1, 2)))
 
         # Combine the features from the 4 brain regions
         x = torch.cat([inferior_6v, superior_6v, inferior_44, superior_44], dim=-1)
         x = self.combination_layers(x)
         x = self.fn(x)
         x = x.permute(0, 2, 1)
+        return x
+
+class BrainPostNet(nn.Module): # modified from AudioEncoder
+    def __init__(
+        self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int
+    ):
+        super().__init__()
+        #self.conv1 = Conv1d(n_mels, n_state, kernel_size=3, padding=1)
+        #self.conv2 = Conv1d(n_state, n_state, kernel_size=3, padding=1)
+        self.register_buffer("positional_embedding", sinusoids(n_ctx, n_state))
+        self.blocks: Iterable[ResidualAttentionBlock] = nn.ModuleList(
+            [ResidualAttentionBlock(n_state, n_head) for _ in range(n_layer)]
+        )
+        self.ln_post = LayerNorm(n_state)
+
+    def forward(self, x: Tensor):
+        """
+        x : torch.Tensor, shape = (batch_size, n_mels, n_ctx)
+            the mel spectrogram of the audio
+        """
+        x = F.gelu(self.conv1(x))
+        x = F.gelu(self.conv2(x))
+        x = x.permute(0, 2, 1) # from (batch_size, n_state, n_ctx) to (batch_size, n_ctx, n_state)
+
+        assert x.shape[1:] == self.positional_embedding.shape, f"incorrect embedding shape {x.shape[1:]} != {self.positional_embedding.shape}"
+        x = (x + self.positional_embedding).to(x.dtype)
+
+        for block in self.blocks:
+            x = block(x)
+
+        x = self.ln_post(x)
         return x
 
 class BrainEncoder(nn.Module):
@@ -196,16 +198,19 @@ class BrainEncoder(nn.Module):
             n_head=n_head,
             n_layer=n_layer,
         )
-
     def forward(self, x: Tensor):
         x = self.prenet(x)
         x = self.encoder(x)
         return x
 
+
 class EmbeddingDiscriminator(nn.Module):
     """A GAN discriminator that takes in a tensor of shape (N, T, D) and outputs a tensor of shape (N, 1)"""
-    def __init__(self, sequence_length: int, embedding_dim: int):
+    def __init__(self, dims: ModelDimensions):
         super().__init__()
+        self.dims = dims
+        sequence_length = dims.n_audio_ctx
+        embedding_dim = dims.n_audio_state
         self.conv_block = nn.Sequential(
             nn.Conv1d(
                 in_channels=embedding_dim,
@@ -226,7 +231,7 @@ class EmbeddingDiscriminator(nn.Module):
             nn.GELU(),
             nn.Dropout(p=0.2),
             nn.Conv1d(
-                in_channels=embedding_dim//32,
+                in_channels=embedding_dim//16,
                 out_channels=1,
                 kernel_size=3,
                 stride=1,
@@ -260,8 +265,12 @@ class EmbeddingDiscriminator(nn.Module):
 
 class LogitsDiscriminator(nn.Module):
     """A GAN discriminator that takes in a tensor of shape (N, S, 51864) and outputs a tensor of shape (N, 1)"""
-    def __init__(self, vocab_size: int = 51864, embedding_dim: int = 512, hidden_dim: int = 256):
+    def __init__(self, dims):
         super().__init__()
+        self.dims = dims
+        vocab_size = dims.n_vocab
+        embedding_dim = 256
+        hidden_dim = 128
         # Reduce vocabulary dimension
         self.fc1 = nn.Linear(vocab_size, embedding_dim)
         self.gelu1 = nn.GELU()
@@ -325,10 +334,10 @@ class WhisperBrain(nn.Module):
         else:
             raise ValueError(f"Invalid mode: {self.mode}")
 
-    def embed_brain(self, signal: Tensor):
+    def embed_brain(self, signal: Tensor, ln_only: bool = True):
         return self.brain_encoder(signal)
 
-    def embed_audio(self, mel: Tensor):
+    def embed_audio(self, mel: Tensor, ln_only: bool = True):
         return self.whisper.embed_audio(mel)
 
     def logits(self, tokens, embeddings):
@@ -384,4 +393,3 @@ class WhisperBrain(nn.Module):
     detect_language = detect_language_function
     transcribe = transcribe_function
     decode = decode_function
-
